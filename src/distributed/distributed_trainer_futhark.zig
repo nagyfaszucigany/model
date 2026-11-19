@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const GPUCoordinator = @import("gpu_coordinator.zig").GPUCoordinator;
 const checkpoint_envelope = @import("checkpoint_envelope.zig");
 const MGT = @import("../tokenizer/mgt.zig").MGT;
@@ -20,8 +21,6 @@ const PatternLocation = core_relational.PatternLocation;
 const Tensor = @import("../core/tensor.zig").Tensor;
 const sfd = @import("../optimizer/sfd.zig");
 const mmap_dataset = @import("mmap_token_dataset.zig");
-const _use_futhark_2d = FutharkArray2DF16;
-const _use_tensor = Tensor;
 pub const CHECKPOINT_MAGIC = checkpoint_envelope.MAGIC;
 pub const CHECKPOINT_VERSION = checkpoint_envelope.VERSION;
 pub const CHECKPOINT_TRAILER = checkpoint_envelope.TRAILER;
@@ -178,37 +177,29 @@ pub const TrainerComponents = struct {
 };
 const BatchBufferPool = struct {
     allocator: std.mem.Allocator,
-    inputs: [2][]u32,
-    targets: [2][]u32,
-    lengths: [2][]usize,
+    inputs: []u32,
+    targets: []u32,
+    lengths: []usize,
     fn init(allocator: std.mem.Allocator, batch_size: usize, sequence_length: usize) !BatchBufferPool {
+        if (batch_size == 0 or sequence_length == 0) return TrainerError.InvalidBatchSize;
         const token_capacity = try std.math.mul(usize, batch_size, sequence_length);
-        var result = BatchBufferPool{
+        const inputs = try allocator.alloc(u32, token_capacity);
+        errdefer allocator.free(inputs);
+        const targets = try allocator.alloc(u32, token_capacity);
+        errdefer allocator.free(targets);
+        const lengths = try allocator.alloc(usize, batch_size);
+        errdefer allocator.free(lengths);
+        return BatchBufferPool{
             .allocator = allocator,
-            .inputs = undefined,
-            .targets = undefined,
-            .lengths = undefined,
+            .inputs = inputs,
+            .targets = targets,
+            .lengths = lengths,
         };
-        var initialized: usize = 0;
-        errdefer {
-            var index: usize = 0;
-            while (index < initialized) : (index += 1) {
-                allocator.free(result.inputs[index]);
-                allocator.free(result.targets[index]);
-                allocator.free(result.lengths[index]);
-            }
-        }
-        while (initialized < 2) : (initialized += 1) {
-            result.inputs[initialized] = try allocator.alloc(u32, token_capacity);
-            result.targets[initialized] = try allocator.alloc(u32, token_capacity);
-            result.lengths[initialized] = try allocator.alloc(usize, batch_size);
-        }
-        return result;
     }
     fn deinit(self: *BatchBufferPool) void {
-        for (self.inputs) |buffer| self.allocator.free(buffer);
-        for (self.targets) |buffer| self.allocator.free(buffer);
-        for (self.lengths) |buffer| self.allocator.free(buffer);
+        self.allocator.free(self.inputs);
+        self.allocator.free(self.targets);
+        self.allocator.free(self.lengths);
         self.* = undefined;
     }
 };
@@ -244,6 +235,7 @@ pub const TrainerError = error{
     InvalidQualityByte,
     NodeIdTooLong,
     NodeDataTooLong,
+    NodeCountTooLarge,
     EdgeCountTooLarge,
     DistributedIntegerPrecisionExceeded,
     InvalidDistributedInteger,
@@ -283,6 +275,7 @@ pub const TrainerError = error{
     CheckpointSaveMustRunOnRoot,
     StepSynchronizerUnavailable,
     InvalidTrainingState,
+    PeerRankFailure,
 };
 fn createConfiguredTokenizer(
     allocator: std.mem.Allocator,
@@ -327,10 +320,7 @@ fn createConfiguredTokenizer(
             anchors = owned_anchors.?.items;
         }
     }
-    const max_vocab_size: ?u32 = if (config.tokenizer_max_merges > 0)
-        std.math.cast(u32, config.tokenizer_max_merges) orelse return TrainerError.InvalidTokenizerConfiguration
-    else
-        null;
+    const max_vocab_size: u32 = std.math.cast(u32, config.tokenizer_max_merges) orelse return TrainerError.InvalidTokenizerConfiguration;
     if (config.tokenizer_factory) |tokenizer_factory| {
         return tokenizer_factory(allocator, vocabulary, anchors, config.tokenizer_max_merges);
     }
@@ -354,22 +344,43 @@ fn resolveEnvUsizeDefault(
 ) TrainerError!usize {
     const owned = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return default_value,
+        error.OutOfMemory => return TrainerError.AllocationFailed,
         else => {
-            std.debug.print("[Rank {d}] WARN: reading env '" ++ name ++ "' failed: {} (using default {d})\n", .{ rank, err, default_value });
-            return default_value;
+            std.debug.print("[Rank {d}] ERROR: reading env '" ++ name ++ "' failed: {}\n", .{ rank, err });
+            return TrainerError.InvalidEnvironmentValue;
         },
     };
     defer allocator.free(owned);
     if (owned.len == 0) {
-        std.debug.print("[Rank {d}] WARN: " ++ name ++ " invalid: empty value (using default {d})\n", .{ rank, default_value });
-        return default_value;
+        std.debug.print("[Rank {d}] ERROR: " ++ name ++ " invalid: empty value\n", .{rank});
+        return TrainerError.InvalidEnvironmentValue;
     }
     const parsed = std.fmt.parseInt(usize, owned, 10) catch {
-        std.debug.print("[Rank {d}] WARN: " ++ name ++ " invalid: not an integer (using default {d})\n", .{ rank, default_value });
-        return default_value;
+        std.debug.print("[Rank {d}] ERROR: " ++ name ++ " invalid: not an integer\n", .{rank});
+        return TrainerError.InvalidEnvironmentValue;
     };
-    if (parsed == 0 or parsed > upper_limit) return TrainerError.InvalidEnvironmentValue;
+    if (parsed == 0 or parsed > upper_limit) {
+        std.debug.print("[Rank {d}] ERROR: " ++ name ++ " invalid: {d} outside 1..{d}\n", .{ rank, parsed, upper_limit });
+        return TrainerError.InvalidEnvironmentValue;
+    }
     return parsed;
+}
+fn resolveTemporaryDirectory(allocator: std.mem.Allocator) ![]u8 {
+    const names = [_][]const u8{ "JAIDE_TMP_DIR", "TMPDIR", "TEMP", "TMP" };
+    for (names) |name| {
+        const value = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => continue,
+            error.OutOfMemory => return TrainerError.AllocationFailed,
+            else => return TrainerError.InvalidEnvironmentValue,
+        };
+        if (value.len == 0) {
+            allocator.free(value);
+            continue;
+        }
+        return value;
+    }
+    const fallback: []const u8 = if (builtin.os.tag == .windows) "." else "/tmp";
+    return allocator.dupe(u8, fallback);
 }
 fn CrcTrackingWriter(comptime WriterType: type) type {
     return struct {
@@ -387,21 +398,90 @@ fn CrcTrackingWriter(comptime WriterType: type) type {
         }
     };
 }
-fn CrcTrackingReader(comptime ReaderType: type) type {
-    return struct {
-        inner: ReaderType,
-        crc: std.hash.Crc32,
-        const Self = @This();
-        pub fn read(self: *Self, buffer: []u8) ReaderType.Error!usize {
-            const nread = try self.inner.read(buffer);
-            self.crc.update(buffer[0..nread]);
-            return nread;
-        }
-        pub const Reader = std.io.Reader(*Self, ReaderType.Error, read);
-        pub fn reader(self: *Self) Reader {
-            return .{ .context = self };
-        }
+fn captureFailure(failure: *?anyerror, result: anytype) ?@typeInfo(@TypeOf(result)).error_union.payload {
+    if (result) |value| {
+        return value;
+    } else |err| {
+        if (failure.* == null) failure.* = err;
+        return null;
+    }
+}
+fn reduceFailureFlag(coordinator: *GPUCoordinator, failed: bool) !bool {
+    if (coordinator.world_size <= 1) return failed;
+    var flag = [1]f32{if (failed) 1.0 else 0.0};
+    const byte_count = @sizeOf(f32);
+    const device_values = try coordinator.allocDeviceMemory(byte_count);
+    defer coordinator.freeDeviceMemory(device_values);
+    try coordinator.copyHostToDevice(device_values, std.mem.sliceAsBytes(flag[0..]), byte_count);
+    try coordinator.allReduceFloat32Max(device_values, device_values, flag.len);
+    try coordinator.copyDeviceToHost(std.mem.sliceAsBytes(flag[0..]), device_values, byte_count);
+    try coordinator.synchronize();
+    return flag[0] != 0.0;
+}
+fn admitEstimate(estimate_config: gpu_memory.EstimateConfig) TrainerError!void {
+    const device_memory = gpu_memory.queryDeviceMemory() catch |err| {
+        std.debug.print("[Trainer] DEVICE_MEMORY_QUERY_FAILED err={s}\n", .{@errorName(err)});
+        return TrainerError.DeviceMemoryQueryFailed;
     };
+    const admission = gpu_memory.admit(estimate_config, device_memory) catch |err| {
+        std.debug.print("[Trainer] MEMORY_ESTIMATE_FAILED err={s}\n", .{@errorName(err)});
+        return TrainerError.MemoryAdmissionRejected;
+    };
+    std.debug.print(
+        "[Trainer] memory_admit device_free={d} device_total={d} reserve={d} budget={d} persistent={d} transient={d} peak={d} rsf={d} embedding={d} activations={d} accepted={}\n",
+        .{
+            admission.free_bytes,
+            admission.total_bytes,
+            admission.reserve_bytes,
+            admission.budget_bytes,
+            admission.estimate.persistent_bytes,
+            admission.estimate.transient_bytes,
+            admission.estimate.peak_bytes,
+            admission.estimate.rsf_param_bytes,
+            admission.estimate.embedding_param_bytes,
+            admission.estimate.activation_bytes,
+            admission.accepted,
+        },
+    );
+    if (!admission.accepted) {
+        std.debug.print(
+            "[Trainer] MEMORY_ADMISSION_REJECTED largest={s} bytes={d} peak={d} budget={d}\n",
+            .{ admission.largest_name, admission.largest_bytes, admission.estimate.peak_bytes, admission.budget_bytes },
+        );
+        return TrainerError.MemoryAdmissionRejected;
+    }
+}
+fn splitMix64(value: u64) u64 {
+    var z = value +% 0x9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+fn feistelPermute(value: u64, half: u6, key: u64) u64 {
+    const mask = (@as(u64, 1) << half) - 1;
+    var left = (value >> half) & mask;
+    var right = value & mask;
+    var round: u64 = 0;
+    while (round < 4) : (round += 1) {
+        const mixed = splitMix64(right ^ splitMix64(key +% round)) & mask;
+        const next_right = left ^ mixed;
+        left = right;
+        right = next_right;
+    }
+    return (left << half) | right;
+}
+fn permuteWindowPosition(position: u64, count: u64, key: u64) u64 {
+    if (count <= 1) return 0;
+    const bits: u7 = 64 - @clz(count - 1);
+    const half: u6 = @intCast((bits + 1) / 2);
+    var value = position;
+    while (true) {
+        value = feistelPermute(value, half, key);
+        if (value < count) return value;
+    }
+}
+fn windowPermutationKey(seed: u64, epoch: u64) u64 {
+    return splitMix64(seed ^ splitMix64(epoch +% 0xA24BAED4963EE407));
 }
 const StepTelemetry = struct {
     step: u64 = 0,
@@ -424,46 +504,21 @@ const StepUpdateJob = struct {
     fused: accel.FusedStepResult,
 };
 const StepSynchronizer = struct {
-    trainer: *DistributedTrainerFuthark,
-    mutex: std.Thread.Mutex,
-    telemetry: StepTelemetry,
-    pending_step_increments: u64,
-    fn init(trainer: *DistributedTrainerFuthark) StepSynchronizer {
-        return .{
-            .trainer = trainer,
-            .mutex = .{},
-            .telemetry = .{},
-            .pending_step_increments = 0,
-        };
-    }
-    fn processStep(self: *StepSynchronizer, job_value: StepUpdateJob) !void {
+    mutex: std.Thread.Mutex = .{},
+    telemetry: StepTelemetry = .{},
+    pending_step_increments: u64 = 0,
+    fn processStep(self: *StepSynchronizer, trainer: *DistributedTrainerFuthark, job_value: StepUpdateJob) !void {
         var job = job_value;
-        try self.processStepJob(&job);
+        try self.processStepJob(trainer, &job);
     }
-    fn processStepJob(self: *StepSynchronizer, job: *StepUpdateJob) !void {
-        const trainer = self.trainer;
+    fn processStepJob(self: *StepSynchronizer, trainer: *DistributedTrainerFuthark, job: *StepUpdateJob) !void {
         const ctx = &trainer.accelerator.ctx;
         defer job.fused.deinit();
-        try ctx.sync();
-        if (trainer.coordinator.world_size > 1) {
-            var gradients = try job.fused.gradientDeviceBuffers();
-            defer {
-                gradients[0].deinit();
-                gradients[1].deinit();
-            }
-            try gradients[0].requireSameContext(ctx);
-            try gradients[1].requireSameContext(ctx);
-            {
-                trainer.nccl_mutex.lock();
-                defer trainer.nccl_mutex.unlock();
-                const gradient_s_ptr = try gradients[0].rawPointer();
-                const gradient_t_ptr = try gradients[1].rawPointer();
-                try trainer.coordinator.allReduceFloat32(gradient_s_ptr, gradient_s_ptr, gradients[0].elementCount());
-                try trainer.coordinator.allReduceFloat32(gradient_t_ptr, gradient_t_ptr, gradients[1].elementCount());
-                try trainer.coordinator.synchronize();
-            }
-        }
-        try trainer.accelerator.applyStackGradientsSFD(
+        var failure: ?anyerror = null;
+        _ = captureFailure(&failure, ctx.sync());
+        try trainer.reduceStackGradients(&job.fused, failure);
+        failure = null;
+        _ = captureFailure(&failure, trainer.accelerator.applyStackGradientsSFD(
             &job.fused.stack_gradient_s,
             &job.fused.stack_gradient_t,
             job.learning_rate,
@@ -472,84 +527,49 @@ const StepSynchronizer = struct {
             job.fisher_epsilon,
             trainer.config.trust_ratio,
             trainer.config.weight_floor,
-        );
-        if (job.apply_embedding_update) {
-            if (trainer.gpu_embedding) |*embedding| {
-                if (trainer.coordinator.world_size > 1) {
-                    {
-                        ctx.mutex.lock();
-                        defer ctx.mutex.unlock();
-                        const gradient_scale = if (trainer.config.grad_mean) job.local_fraction else 1.0;
-                        try embedding.scaleGradient(gradient_scale);
-                    }
-                    try ctx.sync();
-                    var gradient = gradient_buffer: {
-                        ctx.mutex.lock();
-                        defer ctx.mutex.unlock();
-                        break :gradient_buffer try embedding.getGradientDevicePtrF32();
-                    };
-                    defer gradient.deinit();
-                    try gradient.requireSameContext(ctx);
-                    {
-                        trainer.nccl_mutex.lock();
-                        defer trainer.nccl_mutex.unlock();
-                        const gradient_ptr = try gradient.rawPointer();
-                        try trainer.coordinator.allReduceFloat32(gradient_ptr, gradient_ptr, gradient.elementCount());
-                        try trainer.coordinator.synchronize();
-                    }
-                }
-                {
-                    ctx.mutex.lock();
-                    defer ctx.mutex.unlock();
-                    if (trainer.config.use_normalized_gradient_flow) try embedding.clipGradient(trainer.config.gradient_clip_norm);
-                    try embedding.applyUpdateFusedSFD(
-                        job.learning_rate,
-                        job.momentum_beta,
-                        job.fisher_gamma,
-                        job.fisher_epsilon,
-                        trainer.config.trust_ratio,
-                        trainer.config.weight_floor,
-                    );
-                }
-            }
-        }
-        if (job.apply_spectral) {
+        ));
+        try trainer.updateEmbeddingFromJob(job, &failure);
+        if (failure == null and job.apply_spectral) {
             const spectral_started = std.time.nanoTimestamp();
-            try trainer.accelerator.spectralNormalizeLayers(
-                trainer.config.spectral_target_norm,
-            );
-            try trainer.applyEmbeddingSpectralNormalization();
-            if (trainer.coordinator.isRoot()) {
+            if (captureFailure(&failure, trainer.accelerator.spectralNormalizeLayers(trainer.config.spectral_target_norm)) != null) {
+                _ = captureFailure(&failure, trainer.applyEmbeddingSpectralNormalization());
+            }
+            if (failure == null and trainer.coordinator.isRoot()) {
                 const spectral_elapsed = std.time.nanoTimestamp() - spectral_started;
                 std.debug.print("[Rank 0] Step {d} spectral_ms={d}\n", .{ job.step, @divTrunc(spectral_elapsed, std.time.ns_per_ms) });
             }
         }
-        const scalars = try job.fused.finalize();
+        const scalars = if (failure == null) captureFailure(&failure, job.fused.finalize()) else null;
         var source_rms: f32 = 0.0;
-        if (trainer.gpu_embedding) |*embedding| {
-            ctx.mutex.lock();
-            defer ctx.mutex.unlock();
-            source_rms = try embedding.sourceRootMeanSquare();
+        if (failure == null) {
+            if (trainer.gpu_embedding) |*embedding| {
+                ctx.mutex.lock();
+                defer ctx.mutex.unlock();
+                if (captureFailure(&failure, embedding.sourceRootMeanSquare())) |value| source_rms = value;
+            }
         }
-        var reduced_loss = scalars.loss;
-        var reduced_reconstruction = scalars.reconstruction_loss;
-        var reduced_logdet = scalars.logdet_mean;
+        if (failure == null and !std.math.isFinite(source_rms)) failure = TrainerError.InvalidLoss;
+        if (try trainer.agreeOnStatus(failure != null)) return failure orelse TrainerError.PeerRankFailure;
+        const final_scalars = scalars.?;
+        var reduced_loss = final_scalars.loss;
+        var reduced_reconstruction = final_scalars.reconstruction_loss;
+        var reduced_logdet = final_scalars.logdet_mean;
         if (trainer.coordinator.world_size > 1) {
             var weighted = [3]f32{
-                scalars.loss * job.local_fraction,
-                scalars.reconstruction_loss * job.local_fraction,
-                scalars.logdet_mean * job.local_fraction,
+                final_scalars.loss * job.local_fraction,
+                final_scalars.reconstruction_loss * job.local_fraction,
+                final_scalars.logdet_mean * job.local_fraction,
             };
             try trainer.allReduceFloat32Values(weighted[0..]);
             reduced_loss = weighted[0];
             reduced_reconstruction = weighted[1];
             reduced_logdet = weighted[2];
         }
-        if (!std.math.isFinite(reduced_loss) or !std.math.isFinite(reduced_reconstruction) or !std.math.isFinite(reduced_logdet) or !std.math.isFinite(source_rms)) return TrainerError.InvalidLoss;
+        if (!std.math.isFinite(reduced_loss) or !std.math.isFinite(reduced_reconstruction) or !std.math.isFinite(reduced_logdet)) return TrainerError.InvalidLoss;
         const step_increment: u64 = job.local_step_increment;
         self.mutex.lock();
         defer self.mutex.unlock();
-        const pending_step_increments = try std.math.add(u64, self.pending_step_increments, step_increment);
+        const next_pending = try std.math.add(u64, self.pending_step_increments, step_increment);
         self.telemetry = .{
             .step = job.step,
             .loss = reduced_loss,
@@ -558,7 +578,7 @@ const StepSynchronizer = struct {
             .source_rms = source_rms,
             .finalized = true,
         };
-        self.pending_step_increments = pending_step_increments;
+        self.pending_step_increments = next_pending;
     }
 };
 pub const DistributedTrainerFuthark = struct {
@@ -594,7 +614,7 @@ pub const DistributedTrainerFuthark = struct {
     shuffle_control_state: u64,
     shuffle_mutex: std.Thread.Mutex,
     relational_fast_mode: bool,
-    step_synchronizer: ?*StepSynchronizer = null,
+    step_synchronizer: StepSynchronizer = .{},
     nccl_mutex: std.Thread.Mutex = .{},
     last_step_telemetry: StepTelemetry = .{},
     pub const StepResult = struct {
@@ -621,17 +641,9 @@ pub const DistributedTrainerFuthark = struct {
         local_batch_size: usize,
         config: TrainerConfig,
     ) !DistributedTrainerFuthark {
-        const tokenizer = try createConfiguredTokenizer(allocator, config);
-        var tokenizer_transferred = false;
-        errdefer if (!tokenizer_transferred) {
-            var t = tokenizer;
-            t.deinit();
-        };
-        const result = try initWithComponents(allocator, coordinator, model_dim, num_layers, local_batch_size, config, .{
-            .tokenizer = tokenizer,
-        });
-        tokenizer_transferred = true;
-        return result;
+        var tokenizer_failure: ?anyerror = null;
+        const tokenizer = captureFailure(&tokenizer_failure, createConfiguredTokenizer(allocator, config));
+        return initCoordinated(allocator, coordinator, model_dim, num_layers, local_batch_size, config, tokenizer, tokenizer_failure);
     }
     pub fn initWithComponents(
         allocator: std.mem.Allocator,
@@ -642,10 +654,54 @@ pub const DistributedTrainerFuthark = struct {
         config: TrainerConfig,
         components_in: TrainerComponents,
     ) !DistributedTrainerFuthark {
-        const components = components_in;
+        return initCoordinated(allocator, coordinator, model_dim, num_layers, local_batch_size, config, components_in.tokenizer, null);
+    }
+    fn initCoordinated(
+        allocator: std.mem.Allocator,
+        coordinator: *GPUCoordinator,
+        model_dim: usize,
+        num_layers: usize,
+        local_batch_size: usize,
+        config: TrainerConfig,
+        tokenizer: ?MGT,
+        pre_failure: ?anyerror,
+    ) !DistributedTrainerFuthark {
+        var failure = pre_failure;
+        var built: ?DistributedTrainerFuthark = null;
+        if (failure == null) {
+            if (tokenizer) |owned_tokenizer| {
+                built = captureFailure(&failure, buildLocalTrainer(allocator, coordinator, model_dim, num_layers, local_batch_size, config, owned_tokenizer));
+            } else {
+                failure = TrainerError.InvalidTokenizerConfiguration;
+            }
+        }
+        const peer_failed = reduceFailureFlag(coordinator, failure != null) catch |err| {
+            if (built) |*partial| partial.deinit();
+            return err;
+        };
+        if (peer_failed) {
+            if (built) |*partial| partial.deinit();
+            return failure orelse TrainerError.PeerRankFailure;
+        }
+        var trainer = built orelse return TrainerError.InvalidTrainingState;
+        trainer.verifyConfigConsistency(trainer.vocab_size) catch |err| {
+            trainer.deinit();
+            return err;
+        };
+        return trainer;
+    }
+    fn buildLocalTrainer(
+        allocator: std.mem.Allocator,
+        coordinator: *GPUCoordinator,
+        model_dim: usize,
+        num_layers: usize,
+        local_batch_size: usize,
+        config: TrainerConfig,
+        tokenizer_in: MGT,
+    ) !DistributedTrainerFuthark {
         var tokenizer_transferred = false;
         errdefer if (!tokenizer_transferred) {
-            var t = components.tokenizer;
+            var t = tokenizer_in;
             t.deinit();
         };
         if (model_dim == 0 or model_dim % 2 != 0) return TrainerError.InvalidModelDim;
@@ -677,57 +733,26 @@ pub const DistributedTrainerFuthark = struct {
         var batch_buffers_committed = false;
         errdefer if (!batch_buffers_committed) batch_buffers.deinit();
         const actual_model_dim = model_dim;
-        const vocab_size_init = components.tokenizer.next_token_id;
-        const estimate_config = gpu_memory.EstimateConfig{
+        const vocab_size_init = tokenizer_in.next_token_id;
+        try admitEstimate(gpu_memory.EstimateConfig{
             .model_dim = actual_model_dim,
             .num_layers = num_layers,
             .vocab_size = vocab_size_init,
             .batch_size = local_batch_size,
-            .max_seq_len = config.default_max_seq_len,
+            .max_seq_len = runtime_max_seq_len,
             .world_size = coordinator.world_size,
             .stack_only = true,
             .frozen_target_f16_only = config.target_source_frozen,
             .include_graph_chunk = false,
             .spectral_temps = false,
             .coupling = .diagonal,
-        };
-        const device_memory = gpu_memory.queryDeviceMemory() catch |err| {
-            std.debug.print("[Trainer] DEVICE_MEMORY_QUERY_FAILED err={s}\n", .{@errorName(err)});
-            return TrainerError.DeviceMemoryQueryFailed;
-        };
-        const admission = gpu_memory.admit(estimate_config, device_memory) catch |err| {
-            std.debug.print("[Trainer] MEMORY_ESTIMATE_FAILED err={s}\n", .{@errorName(err)});
-            return TrainerError.MemoryAdmissionRejected;
-        };
-        std.debug.print(
-            "[Trainer] memory_admit device_free={d} device_total={d} reserve={d} budget={d} persistent={d} transient={d} peak={d} rsf={d} embedding={d} activations={d} accepted={}\n",
-            .{
-                admission.free_bytes,
-                admission.total_bytes,
-                admission.reserve_bytes,
-                admission.budget_bytes,
-                admission.estimate.persistent_bytes,
-                admission.estimate.transient_bytes,
-                admission.estimate.peak_bytes,
-                admission.estimate.rsf_param_bytes,
-                admission.estimate.embedding_param_bytes,
-                admission.estimate.activation_bytes,
-                admission.accepted,
-            },
-        );
-        if (!admission.accepted) {
-            std.debug.print(
-                "[Trainer] MEMORY_ADMISSION_REJECTED largest={s} bytes={d} peak={d} budget={d}\n",
-                .{ admission.largest_name, admission.largest_bytes, admission.estimate.peak_bytes, admission.budget_bytes },
-            );
-            return TrainerError.MemoryAdmissionRejected;
-        }
+        });
         const accelerator_ptr = try allocator.create(RSFAccelerator);
         var accelerator_ptr_committed = false;
         errdefer if (!accelerator_ptr_committed) allocator.destroy(accelerator_ptr);
         std.debug.print(
             "[Trainer] allocating RSF stacks dim={d} layers={d} vocab={d}\n",
-            .{ actual_model_dim, num_layers, components.tokenizer.next_token_id },
+            .{ actual_model_dim, num_layers, tokenizer_in.next_token_id },
         );
         accelerator_ptr.* = try RSFAccelerator.initMultiLayerWithDepthScale(
             actual_model_dim,
@@ -747,12 +772,12 @@ pub const DistributedTrainerFuthark = struct {
         }
         std.debug.print(
             "[Trainer] allocating embeddings vocab={d} dim={d}\n",
-            .{ components.tokenizer.next_token_id, actual_model_dim },
+            .{ tokenizer_in.next_token_id, actual_model_dim },
         );
         var gpu_embedding = try accel.EmbeddingAccelerator.init(
             allocator,
             &accelerator_ptr.ctx,
-            components.tokenizer.next_token_id,
+            tokenizer_in.next_token_id,
             actual_model_dim,
             config.embedding_seed,
         );
@@ -818,14 +843,16 @@ pub const DistributedTrainerFuthark = struct {
         knowledge_nsir_graph_committed = true;
         r_gpu_committed = true;
         fnds_manager_committed = true;
-        var trainer = DistributedTrainerFuthark{
+        target_source_committed = true;
+        batch_buffers_committed = true;
+        return DistributedTrainerFuthark{
             .allocator = allocator,
             .coordinator = coordinator,
-            .tokenizer = components.tokenizer,
+            .tokenizer = tokenizer_in,
             .accelerator = accelerator_ptr,
             .model_dim = actual_model_dim,
             .num_layers = num_layers,
-            .vocab_size = components.tokenizer.next_token_id,
+            .vocab_size = tokenizer_in.next_token_id,
             .local_batch_size = local_batch_size,
             .global_step = 0,
             .learning_rate = config.learning_rate,
@@ -852,26 +879,6 @@ pub const DistributedTrainerFuthark = struct {
             .shuffle_mutex = .{},
             .relational_fast_mode = if (std.posix.getenv("JAIDE_RELATIONAL_FAST")) |v| std.mem.eql(u8, v, "1") else true,
         };
-        target_source_committed = true;
-        batch_buffers_committed = true;
-        trainer.verifyConfigConsistency(components.tokenizer.next_token_id) catch |err| {
-            trainer.accelerator.deinit();
-            allocator.destroy(trainer.accelerator);
-            if (trainer.target_source) |*source| source.deinit();
-            trainer.gpu_embedding.?.deinit();
-            trainer.fnds_manager.deinit();
-            trainer.r_gpu.deinit();
-            trainer.knowledge_nsir_graph.deinit();
-            allocator.destroy(trainer.knowledge_nsir_graph);
-            trainer.nsir_graph.deinit();
-            allocator.destroy(trainer.nsir_graph);
-            trainer.crev_pipeline.deinit();
-            trainer.crev_kernel.deinit();
-            allocator.destroy(trainer.crev_kernel);
-            trainer.tokenizer.deinit();
-            return err;
-        };
-        return trainer;
     }
     fn verifyConfigConsistency(self: *DistributedTrainerFuthark, local_vocab_size: usize) !void {
         if (self.coordinator.world_size <= 1) return;
@@ -911,26 +918,26 @@ pub const DistributedTrainerFuthark = struct {
             self.config.spectral_interval,
             self.config.max_distributed_integer,
             @intFromBool(self.relational_fast_mode),
+            self.runtime_max_seq_len,
+            self.runtime_tokenizer_max_input_bytes,
         };
         try self.verifyDistributedValues(config_values[0..]);
-        const vocab_u64 = std.math.cast(u64, local_vocab_size) orelse return TrainerError.ValueOverflow;
-        const dim_u64 = std.math.cast(u64, self.model_dim) orelse return TrainerError.ValueOverflow;
-        const layers_u64 = std.math.cast(u64, self.num_layers) orelse return TrainerError.ValueOverflow;
-        if (vocab_u64 > self.config.max_distributed_integer) return TrainerError.DistributedIntegerPrecisionExceeded;
-        if (dim_u64 > self.config.max_distributed_integer) return TrainerError.DistributedIntegerPrecisionExceeded;
-        if (layers_u64 > self.config.max_distributed_integer) return TrainerError.DistributedIntegerPrecisionExceeded;
-        const max_vocab = try self.allReduceMaximumU64(vocab_u64);
-        if (max_vocab != vocab_u64) return TrainerError.DistributedConfigMismatch;
-        const min_vocab_enc = try self.allReduceMaximumU64(self.config.max_distributed_integer - vocab_u64);
-        if (min_vocab_enc != self.config.max_distributed_integer - vocab_u64) return TrainerError.DistributedConfigMismatch;
-        const max_dim = try self.allReduceMaximumU64(dim_u64);
-        if (max_dim != dim_u64) return TrainerError.DistributedConfigMismatch;
-        const min_dim_enc = try self.allReduceMaximumU64(self.config.max_distributed_integer - dim_u64);
-        if (min_dim_enc != self.config.max_distributed_integer - dim_u64) return TrainerError.DistributedConfigMismatch;
-        const max_layers = try self.allReduceMaximumU64(layers_u64);
-        if (max_layers != layers_u64) return TrainerError.DistributedConfigMismatch;
-        const min_layers_enc = try self.allReduceMaximumU64(self.config.max_distributed_integer - layers_u64);
-        if (min_layers_enc != self.config.max_distributed_integer - layers_u64) return TrainerError.DistributedConfigMismatch;
+        const limit = self.config.max_distributed_integer;
+        const vocab_u64: u64 = @intCast(local_vocab_size);
+        const dim_u64: u64 = @intCast(self.model_dim);
+        const layers_u64: u64 = @intCast(self.num_layers);
+        const local_exceeds: u64 = if (vocab_u64 > limit or dim_u64 > limit or layers_u64 > limit) 1 else 0;
+        const global_exceeds = try self.allReduceMaximumU64Raw(local_exceeds, 1);
+        if (global_exceeds != 0) return TrainerError.DistributedIntegerPrecisionExceeded;
+        const max_vocab = try self.allReduceMaximumU64Raw(vocab_u64, limit);
+        const min_vocab_enc = try self.allReduceMaximumU64Raw(limit - vocab_u64, limit);
+        const max_dim = try self.allReduceMaximumU64Raw(dim_u64, limit);
+        const min_dim_enc = try self.allReduceMaximumU64Raw(limit - dim_u64, limit);
+        const max_layers = try self.allReduceMaximumU64Raw(layers_u64, limit);
+        const min_layers_enc = try self.allReduceMaximumU64Raw(limit - layers_u64, limit);
+        if (max_vocab != vocab_u64 or min_vocab_enc != limit - vocab_u64) return TrainerError.DistributedConfigMismatch;
+        if (max_dim != dim_u64 or min_dim_enc != limit - dim_u64) return TrainerError.DistributedConfigMismatch;
+        if (max_layers != layers_u64 or min_layers_enc != limit - layers_u64) return TrainerError.DistributedConfigMismatch;
     }
     fn resetSpectralState(self: *DistributedTrainerFuthark) void {
         const ctx = &self.accelerator.ctx;
@@ -943,29 +950,14 @@ pub const DistributedTrainerFuthark = struct {
         self.gpu_spectral_u = null;
         self.gpu_spectral_v = null;
     }
-    fn ensureStepSynchronizer(self: *DistributedTrainerFuthark) !void {
-        if (self.step_synchronizer != null) return;
-        const synchronizer = try self.allocator.create(StepSynchronizer);
-        errdefer self.allocator.destroy(synchronizer);
-        synchronizer.* = StepSynchronizer.init(self);
-        self.step_synchronizer = synchronizer;
-    }
-    fn stopStepSynchronizer(self: *DistributedTrainerFuthark) void {
-        if (self.step_synchronizer) |synchronizer| {
-            self.allocator.destroy(synchronizer);
-            self.step_synchronizer = null;
-        }
-    }
     fn absorbStepTelemetry(self: *DistributedTrainerFuthark) !void {
-        const synchronizer = self.step_synchronizer orelse return;
+        const synchronizer = &self.step_synchronizer;
         synchronizer.mutex.lock();
-        const increments = synchronizer.pending_step_increments;
+        defer synchronizer.mutex.unlock();
+        const next_step = try std.math.add(u64, self.global_step, synchronizer.pending_step_increments);
+        self.global_step = next_step;
         synchronizer.pending_step_increments = 0;
         self.last_step_telemetry = synchronizer.telemetry;
-        synchronizer.mutex.unlock();
-        if (increments > 0) {
-            self.global_step = try std.math.add(u64, self.global_step, increments);
-        }
     }
     fn absorbStepState(self: *DistributedTrainerFuthark) !void {
         try self.absorbStepTelemetry();
@@ -982,7 +974,6 @@ pub const DistributedTrainerFuthark = struct {
         }
     }
     pub fn deinit(self: *DistributedTrainerFuthark) void {
-        self.stopStepSynchronizer();
         self.accelerator.sync() catch |err| {
             std.debug.print("[Rank {d}] WARN: accelerator.sync during deinit failed: {}\n", .{ self.coordinator.rank, err });
         };
@@ -1024,8 +1015,8 @@ pub const DistributedTrainerFuthark = struct {
         return std.fs.cwd().openFile(path, .{ .mode = .read_only });
     }
     fn createWriteFile(path: []const u8) !std.fs.File {
-        if (std.fs.path.isAbsolute(path)) return std.fs.createFileAbsolute(path, .{ .mode = 0o600, .truncate = true });
-        return std.fs.cwd().createFile(path, .{ .mode = 0o600, .truncate = true });
+        if (std.fs.path.isAbsolute(path)) return std.fs.createFileAbsolute(path, .{ .mode = 0o600, .truncate = true, .exclusive = true });
+        return std.fs.cwd().createFile(path, .{ .mode = 0o600, .truncate = true, .exclusive = true });
     }
     fn deletePath(path: []const u8) void {
         if (std.fs.path.isAbsolute(path)) {
@@ -1052,13 +1043,6 @@ pub const DistributedTrainerFuthark = struct {
             std.fs.cwd().openDir(dir_path, .{}) catch return;
         defer dir.close();
         std.posix.fsync(dir.fd) catch {};
-    }
-    fn writeF32(writer: anytype, value: f32) !void {
-        try writer.writeInt(u32, @as(u32, @bitCast(value)), .little);
-    }
-    fn readF32(reader: anytype) !f32 {
-        const bits = try reader.readInt(u32, .little);
-        return @as(f32, @bitCast(bits));
     }
     fn writeF32Array(writer: anytype, values: []const f32, require_nonnegative: bool) !void {
         try writer.writeInt(u64, @intCast(values.len), .little);
@@ -1090,6 +1074,12 @@ pub const DistributedTrainerFuthark = struct {
             boundary -= 1;
         }
         return text[0..boundary];
+    }
+    fn agreeOnStatus(self: *DistributedTrainerFuthark, local_failed: bool) !bool {
+        if (self.coordinator.world_size <= 1) return local_failed;
+        self.nccl_mutex.lock();
+        defer self.nccl_mutex.unlock();
+        return reduceFailureFlag(self.coordinator, local_failed);
     }
     fn allReduceFloat32Values(self: *DistributedTrainerFuthark, values: []f32) !void {
         if (values.len == 0 or self.coordinator.world_size <= 1) return;
@@ -1210,17 +1200,41 @@ pub const DistributedTrainerFuthark = struct {
         if (carry != 0 or result > @as(u128, std.math.maxInt(u64))) return TrainerError.ValueOverflow;
         return @intCast(result);
     }
+    fn settlePreparedBatch(self: *DistributedTrainerFuthark, failure: ?anyerror, prepared: *?PreparedBatch) !void {
+        const peer_failed = self.agreeOnStatus(failure != null) catch |err| {
+            if (prepared.*) |*value| value.deinit();
+            prepared.* = null;
+            return err;
+        };
+        if (peer_failed) {
+            if (prepared.*) |*value| value.deinit();
+            prepared.* = null;
+            return failure orelse TrainerError.PeerRankFailure;
+        }
+    }
+    fn prepareBatchAgreed(self: *DistributedTrainerFuthark, batch: [][]const u8) !PreparedBatch {
+        var failure: ?anyerror = null;
+        var prepared = captureFailure(&failure, self.prepareBatch(batch));
+        try self.settlePreparedBatch(failure, &prepared);
+        return prepared orelse TrainerError.InvalidTrainingState;
+    }
+    fn prepareNextBatchAgreed(self: *DistributedTrainerFuthark, next_batch: ?[][]const u8, next_prepared: *?PreparedBatch) !void {
+        next_prepared.* = null;
+        var failure: ?anyerror = null;
+        if (next_batch) |batch| {
+            next_prepared.* = captureFailure(&failure, self.prepareBatch(batch));
+        }
+        try self.settlePreparedBatch(failure, next_prepared);
+    }
     pub fn trainEpoch(self: *DistributedTrainerFuthark, samples: [][]const u8) !f32 {
         if (self.local_batch_size == 0) return TrainerError.InvalidBatchSize;
-        const local_batch_count: u64 = if (samples.len == 0) 0 else blk: {
-            const inc = try std.math.add(usize, samples.len, self.local_batch_size - 1);
-            break :blk @as(u64, inc / self.local_batch_size);
-        };
+        const local_batch_count: u64 = if (samples.len == 0) 0 else @as(u64, (samples.len - 1) / self.local_batch_size + 1);
         const target_batch_count = try self.allReduceMaximumU64(local_batch_count);
         var total_weighted_loss: f64 = 0.0;
         var total_sample_weight: f64 = 0.0;
         var batch_start: usize = 0;
         var current_prepared: ?PreparedBatch = null;
+        defer if (current_prepared) |*prepared| prepared.deinit();
         if (target_batch_count > 0) {
             var first_batch: [][]const u8 = &.{};
             if (batch_start < samples.len) {
@@ -1230,9 +1244,8 @@ pub const DistributedTrainerFuthark = struct {
                 first_batch = samples[batch_start..batch_end];
                 batch_start = batch_end;
             }
-            current_prepared = try self.prepareBatch(first_batch);
+            current_prepared = try self.prepareBatchAgreed(first_batch);
         }
-        defer if (current_prepared) |*prepared| prepared.deinit();
         var batch_index: u64 = 0;
         while (batch_index < target_batch_count) : (batch_index += 1) {
             var next_batch: ?[][]const u8 = null;
@@ -1337,29 +1350,70 @@ pub const DistributedTrainerFuthark = struct {
             self.* = undefined;
         }
     };
+    const TokenEpochLayout = struct {
+        window_size: usize,
+        selected_windows: usize,
+        rank_start: usize,
+        rank_count: usize,
+        local_batch_count: u64,
+        global_batch_count: u64,
+    };
+    fn tokenEpochLayout(
+        self: *DistributedTrainerFuthark,
+        dataset: *const mmap_dataset.MmapTokenDataset,
+        epoch: u64,
+        first_batch: u64,
+    ) !TokenEpochLayout {
+        const window_size = std.math.add(usize, self.runtime_max_seq_len, 1) catch return TrainerError.ValueOverflow;
+        const total_windows = dataset.payload.len / window_size;
+        const selected_windows = if (self.config.training_sample_count == 0)
+            total_windows
+        else
+            @min(total_windows, self.config.training_sample_count);
+        const rank_bounds = try rankWindowBounds(selected_windows, self.coordinator.world_size, self.coordinator.rank);
+        const local_batch_count: u64 = if (rank_bounds.count == 0) 0 else @as(u64, (rank_bounds.count - 1) / self.local_batch_size + 1);
+        const global_batch_count = try self.allReduceMaximumU64(local_batch_count);
+        const agreement = [_]u64{ epoch, first_batch, @intCast(selected_windows), @intCast(window_size) };
+        try self.verifyDistributedValues(agreement[0..]);
+        if (first_batch > global_batch_count) return TrainerError.IndexOutOfBounds;
+        return TokenEpochLayout{
+            .window_size = window_size,
+            .selected_windows = selected_windows,
+            .rank_start = rank_bounds.start,
+            .rank_count = rank_bounds.count,
+            .local_batch_count = local_batch_count,
+            .global_batch_count = global_batch_count,
+        };
+    }
     fn prepareTokenBatch(
         self: *DistributedTrainerFuthark,
-        token_stream: []const u32,
-        batch_size: usize,
-        sequence_length: usize,
-        slot: usize,
+        payload: []const u32,
+        layout: TokenEpochLayout,
+        batch_index: u64,
+        permutation_key: u64,
     ) !PreparedBatch {
-        if (slot >= 2 or batch_size == 0 or batch_size > self.local_batch_size or sequence_length == 0) return TrainerError.InvalidBatchSize;
-        const required = std.math.add(usize, sequence_length, 1) catch return TrainerError.ValueOverflow;
-        const source_required = std.math.mul(usize, batch_size, required) catch return TrainerError.ValueOverflow;
-        if (token_stream.len < source_required) return TrainerError.IndexOutOfBounds;
+        const batch_offset = std.math.mul(usize, @intCast(batch_index), self.local_batch_size) catch return TrainerError.ValueOverflow;
+        if (batch_offset >= layout.rank_count) return TrainerError.IndexOutOfBounds;
+        const batch_size = @min(self.local_batch_size, layout.rank_count - batch_offset);
+        const sequence_length = self.runtime_max_seq_len;
+        if (batch_size == 0 or sequence_length == 0) return TrainerError.InvalidBatchSize;
         const token_count = std.math.mul(usize, batch_size, sequence_length) catch return TrainerError.ValueOverflow;
-        const inputs = self.batch_buffers.inputs[slot][0..token_count];
-        const targets = self.batch_buffers.targets[slot][0..token_count];
-        const lengths = self.batch_buffers.lengths[slot][0..batch_size];
+        const inputs = self.batch_buffers.inputs[0..token_count];
+        const targets = self.batch_buffers.targets[0..token_count];
+        const lengths = self.batch_buffers.lengths[0..batch_size];
         @memset(inputs, 0);
         @memset(targets, 0);
         @memset(lengths, sequence_length);
-        var batch_index: usize = 0;
-        while (batch_index < batch_size) : (batch_index += 1) {
-            const source_base = std.math.mul(usize, batch_index, required) catch return TrainerError.ValueOverflow;
-            const target_base = std.math.mul(usize, batch_index, sequence_length) catch return TrainerError.ValueOverflow;
-            const source = token_stream[source_base .. source_base + required];
+        var row: usize = 0;
+        while (row < batch_size) : (row += 1) {
+            const local_position = std.math.add(usize, batch_offset, row) catch return TrainerError.ValueOverflow;
+            const position = std.math.add(usize, layout.rank_start, local_position) catch return TrainerError.ValueOverflow;
+            const window: usize = @intCast(permuteWindowPosition(@intCast(position), @intCast(layout.selected_windows), permutation_key));
+            const source_base = std.math.mul(usize, window, layout.window_size) catch return TrainerError.ValueOverflow;
+            const source_end = std.math.add(usize, source_base, layout.window_size) catch return TrainerError.ValueOverflow;
+            if (source_end > payload.len) return TrainerError.IndexOutOfBounds;
+            const source = payload[source_base..source_end];
+            const target_base = std.math.mul(usize, row, sequence_length) catch return TrainerError.ValueOverflow;
             const input_row = inputs[target_base .. target_base + sequence_length];
             const target_row = targets[target_base .. target_base + sequence_length];
             @memcpy(input_row, source[0..sequence_length]);
@@ -1381,46 +1435,35 @@ pub const DistributedTrainerFuthark = struct {
             .pooled = true,
         };
     }
+    pub fn epochBatchCount(self: *DistributedTrainerFuthark, dataset: *const mmap_dataset.MmapTokenDataset) !u64 {
+        const layout = try self.tokenEpochLayout(dataset, 0, 0);
+        return layout.global_batch_count;
+    }
     pub fn trainEpochTokens(self: *DistributedTrainerFuthark, dataset: *const mmap_dataset.MmapTokenDataset, epoch: u64) !f32 {
-        const window_size = std.math.add(usize, self.runtime_max_seq_len, 1) catch return TrainerError.ValueOverflow;
-        const total_windows = dataset.payload.len / window_size;
-        const selected_windows = if (self.config.training_sample_count == 0)
-            total_windows
-        else
-            @min(total_windows, self.config.training_sample_count);
-        const rank_bounds = try rankWindowBounds(selected_windows, self.coordinator.world_size, self.coordinator.rank);
-        const batch_count = if (rank_bounds.count == 0)
-            0
-        else
-            (rank_bounds.count + self.local_batch_size - 1) / self.local_batch_size;
-        const global_batch_count = try self.allReduceMaximumU64(@intCast(batch_count));
+        return self.trainEpochTokensFrom(dataset, epoch, 0);
+    }
+    pub fn trainEpochTokensFrom(
+        self: *DistributedTrainerFuthark,
+        dataset: *const mmap_dataset.MmapTokenDataset,
+        epoch: u64,
+        first_batch: u64,
+    ) !f32 {
+        const layout = try self.tokenEpochLayout(dataset, epoch, first_batch);
+        const permutation_key = windowPermutationKey(self.config.embedding_seed, epoch);
         var weighted_loss: f64 = 0.0;
         var weight: f64 = 0.0;
-        var index: u64 = 0;
-        while (index < global_batch_count) : (index += 1) {
-            var prepared: PreparedBatch = undefined;
-            if (index < batch_count) {
-                const local_window_index = std.math.mul(usize, @intCast(index), self.local_batch_size) catch return TrainerError.ValueOverflow;
-                const current_batch_size = @min(self.local_batch_size, rank_bounds.count - local_window_index);
-                const window_index = std.math.add(usize, rank_bounds.start, local_window_index) catch return TrainerError.ValueOverflow;
-                const start = std.math.mul(usize, window_index, window_size) catch return TrainerError.ValueOverflow;
-                const source_length = std.math.mul(usize, current_batch_size, window_size) catch return TrainerError.ValueOverflow;
-                prepared = try self.prepareTokenBatch(dataset.payload[start .. start + source_length], current_batch_size, self.runtime_max_seq_len, 0);
+        var index: u64 = first_batch;
+        while (index < layout.global_batch_count) : (index += 1) {
+            var prepare_failure: ?anyerror = null;
+            var prepared_opt: ?PreparedBatch = null;
+            if (index < layout.local_batch_count) {
+                prepared_opt = captureFailure(&prepare_failure, self.prepareTokenBatch(dataset.payload, layout, index, permutation_key));
             } else {
-                prepared = PreparedBatch{
-                    .allocator = self.allocator,
-                    .token_lists = std.ArrayList(std.ArrayList(u32)).init(self.allocator),
-                    .active_lists = std.ArrayList(std.ArrayList(u32)).init(self.allocator),
-                    .real_sequence_lengths = self.batch_buffers.lengths[0][0..1],
-                    .flat_input_tokens = self.batch_buffers.inputs[0][0..self.runtime_max_seq_len],
-                    .flat_target_tokens = self.batch_buffers.targets[0][0..self.runtime_max_seq_len],
-                    .effective_batch_size = 1,
-                    .sequence_length = 1,
-                    .local_active_samples = 0,
-                    .local_token_count = 0,
-                    .pooled = true,
-                };
+                const empty_batch: [][]const u8 = &.{};
+                prepared_opt = captureFailure(&prepare_failure, self.prepareBatch(empty_batch));
             }
+            try self.settlePreparedBatch(prepare_failure, &prepared_opt);
+            var prepared = prepared_opt orelse return TrainerError.InvalidTrainingState;
             defer prepared.deinit();
             var no_next: ?PreparedBatch = null;
             const result = try self.trainPreparedStepFuthark(&prepared, null, &no_next);
@@ -1433,7 +1476,6 @@ pub const DistributedTrainerFuthark = struct {
         if (weight == 0.0) return 0.0;
         const loss: f32 = @floatCast(weighted_loss / weight);
         if (!std.math.isFinite(loss)) return TrainerError.InvalidLoss;
-        _ = epoch;
         return loss;
     }
     fn rankWindowBounds(total: usize, world_size: usize, rank: usize) !struct { start: usize, count: usize } {
@@ -1460,7 +1502,8 @@ pub const DistributedTrainerFuthark = struct {
         }
         const sequence_length = self.runtime_max_seq_len;
         const max_token_count = try std.math.add(usize, sequence_length, 1);
-        const maximum_input_bytes = try std.math.mul(usize, max_token_count, 4);
+        const token_bound_bytes = try std.math.mul(usize, max_token_count, 4);
+        const maximum_input_bytes = @min(token_bound_bytes, self.runtime_tokenizer_max_input_bytes);
         for (batch) |text| {
             var token_list = std.ArrayList(u32).init(self.allocator);
             const bounded_text = truncateUtf8Input(text, maximum_input_bytes);
@@ -1513,9 +1556,7 @@ pub const DistributedTrainerFuthark = struct {
                 );
                 const input_token = token_list.items[sequence_index];
                 const target_token = token_list.items[sequence_index + 1];
-                if (self.gpu_embedding) |embedding| {
-                    if (@as(usize, input_token) >= embedding.vocab_size or @as(usize, target_token) >= embedding.vocab_size) return TrainerError.TokenIndexOutOfRange;
-                }
+                if (@as(usize, input_token) >= self.vocab_size or @as(usize, target_token) >= self.vocab_size) return TrainerError.TokenIndexOutOfRange;
                 flat_input_tokens[flat_index] = input_token;
                 flat_target_tokens[flat_index] = target_token;
             }
@@ -1582,6 +1623,89 @@ pub const DistributedTrainerFuthark = struct {
             input_delta,
         );
     }
+    fn reduceStackGradients(self: *DistributedTrainerFuthark, fused: *accel.FusedStepResult, pre_failure: ?anyerror) !void {
+        var failure = pre_failure;
+        const distributed = self.coordinator.world_size > 1;
+        const ctx = &self.accelerator.ctx;
+        var views = if (failure == null and distributed) captureFailure(&failure, fused.gradientDeviceBuffers()) else null;
+        defer if (views) |*held| {
+            held.*[0].deinit();
+            held.*[1].deinit();
+        };
+        if (views) |*held| {
+            if (captureFailure(&failure, held.*[0].requireSameContext(ctx)) != null) {
+                _ = captureFailure(&failure, held.*[1].requireSameContext(ctx));
+            }
+        }
+        const pointer_s = if (failure == null) (if (views) |*held| captureFailure(&failure, held.*[0].rawPointer()) else null) else null;
+        const pointer_t = if (failure == null) (if (views) |*held| captureFailure(&failure, held.*[1].rawPointer()) else null) else null;
+        if (try self.agreeOnStatus(failure != null)) return failure orelse TrainerError.PeerRankFailure;
+        if (!distributed) return;
+        if (views) |*held| {
+            {
+                self.nccl_mutex.lock();
+                defer self.nccl_mutex.unlock();
+                try self.coordinator.allReduceFloat32(pointer_s.?, pointer_s.?, held.*[0].elementCount());
+                try self.coordinator.allReduceFloat32(pointer_t.?, pointer_t.?, held.*[1].elementCount());
+                try self.coordinator.synchronize();
+            }
+            held.*[0].deinit();
+            held.*[1].deinit();
+            views = null;
+        }
+    }
+    fn updateEmbeddingFromJob(self: *DistributedTrainerFuthark, job: *const StepUpdateJob, failure: *?anyerror) !void {
+        const ctx = &self.accelerator.ctx;
+        const distributed = self.coordinator.world_size > 1;
+        const active = job.apply_embedding_update and self.gpu_embedding != null;
+        if (failure.* == null and active and distributed) {
+            const embedding = &self.gpu_embedding.?;
+            {
+                ctx.mutex.lock();
+                defer ctx.mutex.unlock();
+                const gradient_scale: f32 = if (self.config.grad_mean) job.local_fraction else 1.0;
+                _ = captureFailure(failure, embedding.scaleGradient(gradient_scale));
+            }
+            if (failure.* == null) _ = captureFailure(failure, ctx.sync());
+        }
+        var gradient = if (failure.* == null and active and distributed) blk: {
+            ctx.mutex.lock();
+            defer ctx.mutex.unlock();
+            break :blk captureFailure(failure, self.gpu_embedding.?.getGradientDevicePtrF32());
+        } else null;
+        defer if (gradient) |*held| held.deinit();
+        if (gradient) |*held| {
+            _ = captureFailure(failure, held.requireSameContext(ctx));
+        }
+        const gradient_pointer = if (failure.* == null) (if (gradient) |*held| captureFailure(failure, held.rawPointer()) else null) else null;
+        if (try self.agreeOnStatus(failure.* != null)) return failure.* orelse TrainerError.PeerRankFailure;
+        if (gradient) |*held| {
+            {
+                self.nccl_mutex.lock();
+                defer self.nccl_mutex.unlock();
+                try self.coordinator.allReduceFloat32(gradient_pointer.?, gradient_pointer.?, held.elementCount());
+                try self.coordinator.synchronize();
+            }
+            held.deinit();
+            gradient = null;
+        }
+        if (active) {
+            ctx.mutex.lock();
+            defer ctx.mutex.unlock();
+            const embedding = &self.gpu_embedding.?;
+            if (self.config.use_normalized_gradient_flow) _ = captureFailure(failure, embedding.clipGradient(self.config.gradient_clip_norm));
+            if (failure.* == null) {
+                _ = captureFailure(failure, embedding.applyUpdateFusedSFD(
+                    job.learning_rate,
+                    job.momentum_beta,
+                    job.fisher_gamma,
+                    job.fisher_epsilon,
+                    self.config.trust_ratio,
+                    self.config.weight_floor,
+                ));
+            }
+        }
+    }
     fn trainPreparedStepFuthark(
         self: *DistributedTrainerFuthark,
         prepared: *PreparedBatch,
@@ -1589,11 +1713,10 @@ pub const DistributedTrainerFuthark = struct {
         next_prepared: *?PreparedBatch,
     ) !StepResult {
         next_prepared.* = null;
-        try self.ensureStepSynchronizer();
         try self.absorbStepState();
         const global_active_samples = try self.allReduceSumU64(prepared.local_active_samples);
         if (global_active_samples == 0) {
-            if (next_batch) |batch| next_prepared.* = try self.prepareBatch(batch);
+            try self.prepareNextBatchAgreed(next_batch, next_prepared);
             return StepResult{ .step = self.global_step, .loss = 0.0, .reconstruction_loss = 0.0, .source_rms = 0.0, .sample_weight = 0.0 };
         }
         const global_token_count = if (self.coordinator.world_size > 1)
@@ -1601,7 +1724,7 @@ pub const DistributedTrainerFuthark = struct {
         else
             prepared.local_token_count;
         if (global_token_count == 0) {
-            if (next_batch) |batch| next_prepared.* = try self.prepareBatch(batch);
+            try self.prepareNextBatchAgreed(next_batch, next_prepared);
             return StepResult{ .step = self.global_step, .loss = 0.0, .reconstruction_loss = 0.0, .source_rms = 0.0, .sample_weight = 0.0 };
         }
         const local_fraction: f32 = if (self.coordinator.world_size > 1)
@@ -1612,24 +1735,6 @@ pub const DistributedTrainerFuthark = struct {
         else
             1.0;
         if (!std.math.isFinite(local_fraction) or local_fraction < 0.0 or local_fraction > 1.0) return TrainerError.InvalidReductionWeight;
-        const BatchTensors = struct {
-            inputs: FutharkArray3DF16,
-            targets: FutharkArray3DF16,
-        };
-        var tensors = if (self.gpu_embedding) |*embedding| embedding_block: {
-            const context = &self.accelerator.ctx;
-            context.mutex.lock();
-            defer context.mutex.unlock();
-            var inputs = try embedding.forwardPadded(prepared.flat_input_tokens, prepared.real_sequence_lengths, prepared.sequence_length);
-            errdefer inputs.free(context) catch |err| std.log.err("distributed trainer: releasing padded input embeddings failed: {s}", .{@errorName(err)});
-            const targets = if (self.target_source) |*frozen_source|
-                try frozen_source.forwardPadded(prepared.flat_target_tokens, prepared.real_sequence_lengths, prepared.sequence_length)
-            else
-                try embedding.forwardPadded(prepared.flat_target_tokens, prepared.real_sequence_lengths, prepared.sequence_length);
-            break :embedding_block BatchTensors{ .inputs = inputs, .targets = targets };
-        } else return TrainerError.InvalidTrainingState;
-        defer tensors.inputs.free(&self.accelerator.ctx) catch |err| std.log.err("distributed trainer: releasing padded input embeddings failed: {s}", .{@errorName(err)});
-        defer tensors.targets.free(&self.accelerator.ctx) catch |err| std.log.err("distributed trainer: releasing padded target embeddings failed: {s}", .{@errorName(err)});
         const completed_step = std.math.add(u64, self.global_step, 1) catch return TrainerError.ValueOverflow;
         const warmup_factor: f32 = if (self.config.optimizer_warmup_steps > 0 and completed_step < self.config.optimizer_warmup_steps)
             @as(f32, @floatFromInt(completed_step)) / @as(f32, @floatFromInt(self.config.optimizer_warmup_steps))
@@ -1642,7 +1747,7 @@ pub const DistributedTrainerFuthark = struct {
         if (report_progress) {
             std.debug.print(
                 "[Rank 0] Step {d} start batch={d} seq={d} dim={d} layers={d} tokens={d}\n",
-                .{ completed_step, prepared.active_lists.items.len, prepared.sequence_length, self.model_dim, self.num_layers, prepared.local_token_count },
+                .{ completed_step, prepared.effective_batch_size, prepared.sequence_length, self.model_dim, self.num_layers, prepared.local_token_count },
             );
         }
         const step_for_phase = self.global_step;
@@ -1659,61 +1764,100 @@ pub const DistributedTrainerFuthark = struct {
             break :blk value;
         };
         const clamped_reconstruction_alpha = @max(@as(f32, 0.0), @min(@as(f32, 1.0), effective_reconstruction_alpha));
+        const BatchTensors = struct {
+            inputs: FutharkArray3DF16,
+            targets: FutharkArray3DF16,
+        };
+        var local_failure: ?anyerror = null;
+        var tensors: ?BatchTensors = null;
+        defer if (tensors) |*held| {
+            held.inputs.free(&self.accelerator.ctx) catch |err| std.log.err("distributed trainer: releasing padded input embeddings failed: {s}", .{@errorName(err)});
+            held.targets.free(&self.accelerator.ctx) catch |err| std.log.err("distributed trainer: releasing padded target embeddings failed: {s}", .{@errorName(err)});
+        };
+        if (self.gpu_embedding) |*embedding| {
+            const context = &self.accelerator.ctx;
+            context.mutex.lock();
+            defer context.mutex.unlock();
+            const forward_inputs = captureFailure(&local_failure, embedding.forwardPadded(prepared.flat_input_tokens, prepared.real_sequence_lengths, prepared.sequence_length));
+            if (forward_inputs) |input_value| {
+                var input_handle = input_value;
+                const forward_targets = if (self.target_source) |*frozen_source|
+                    captureFailure(&local_failure, frozen_source.forwardPadded(prepared.flat_target_tokens, prepared.real_sequence_lengths, prepared.sequence_length))
+                else
+                    captureFailure(&local_failure, embedding.forwardPadded(prepared.flat_target_tokens, prepared.real_sequence_lengths, prepared.sequence_length));
+                if (forward_targets) |target_value| {
+                    tensors = BatchTensors{ .inputs = input_handle, .targets = target_value };
+                } else {
+                    input_handle.free(context) catch |err| std.log.err("distributed trainer: releasing padded input embeddings failed: {s}", .{@errorName(err)});
+                }
+            }
+        } else {
+            local_failure = TrainerError.InvalidTrainingState;
+        }
         var preparation_task: ?BatchPreparationTask = if (next_batch) |batch|
             BatchPreparationTask{ .trainer = self, .batch = batch }
         else
             null;
         var preparation_thread: ?std.Thread = null;
-        if (preparation_task) |*task| {
-            preparation_thread = try std.Thread.spawn(.{}, BatchPreparationTask.run, .{task});
-        }
         defer {
             if (preparation_thread) |thread| thread.join();
             if (preparation_task) |*task| {
                 if (task.result) |*value| value.deinit();
             }
         }
-        var fused_result = try self.accelerator.fusedTrainingStep(
-            &tensors.inputs,
-            &tensors.targets,
-            prepared.real_sequence_lengths,
-            self.config.grad_mean,
-            if (self.config.grad_mean) local_fraction else 1.0,
-            clamped_reconstruction_alpha,
-            @as(f32, 1.0),
-            self.config.logdet_weight,
-        );
-        var fused_result_committed = false;
-        defer if (!fused_result_committed) fused_result.deinit();
-        const step_backward_ns = std.time.nanoTimestamp() - step_t0_ns;
-        if (report_progress) std.debug.print("[Rank 0] Step {d} RSF/OFTB reversible backward gradients computed dt={d}ms\n", .{ completed_step, @divTrunc(step_backward_ns, 1_000_000) });
-        try self.accumulateEmbeddingGradientsFromDelta(
-            prepared.flat_input_tokens,
-            prepared.real_sequence_lengths,
-            &fused_result.input_delta,
-        );
-        var apply_spectral = false;
-        if (self.gpu_embedding) |_| {
-            if (self.config.spectral_iterations > 0) {
-                if (completed_step % self.config.spectral_interval == 0) apply_spectral = true;
+        if (local_failure == null) {
+            if (preparation_task) |*task| {
+                preparation_thread = std.Thread.spawn(.{}, BatchPreparationTask.run, .{task}) catch |err| blk: {
+                    local_failure = err;
+                    break :blk null;
+                };
             }
         }
+        var fused_result: ?accel.FusedStepResult = null;
+        defer if (fused_result) |*value| value.deinit();
+        if (local_failure == null) {
+            if (tensors) |*held| {
+                fused_result = captureFailure(&local_failure, self.accelerator.fusedTrainingStep(
+                    &held.inputs,
+                    &held.targets,
+                    prepared.real_sequence_lengths,
+                    self.config.grad_mean,
+                    if (self.config.grad_mean) local_fraction else 1.0,
+                    clamped_reconstruction_alpha,
+                    @as(f32, 1.0),
+                    self.config.logdet_weight,
+                ));
+            }
+        }
+        if (local_failure == null) {
+            if (fused_result) |*value| {
+                _ = captureFailure(&local_failure, self.accumulateEmbeddingGradientsFromDelta(
+                    prepared.flat_input_tokens,
+                    prepared.real_sequence_lengths,
+                    &value.input_delta,
+                ));
+            }
+        }
+        if (try self.agreeOnStatus(local_failure != null)) return local_failure orelse TrainerError.PeerRankFailure;
+        const step_backward_ns = std.time.nanoTimestamp() - step_t0_ns;
+        if (report_progress) std.debug.print("[Rank 0] Step {d} RSF/OFTB reversible backward gradients computed dt={d}ms\n", .{ completed_step, @divTrunc(step_backward_ns, 1_000_000) });
+        const apply_spectral = self.gpu_embedding != null and self.config.spectral_iterations > 0 and completed_step % self.config.spectral_interval == 0;
         if (report_progress) std.debug.print("[Rank 0] Step {d} gradients accumulated, reducing current-step gradients\n", .{completed_step});
-        const synchronizer = self.step_synchronizer orelse return TrainerError.StepSynchronizerUnavailable;
         const step_increment_value: u64 = 1;
-        fused_result_committed = true;
+        const job_fused = fused_result orelse return TrainerError.InvalidTrainingState;
+        fused_result = null;
         const update_started = std.time.nanoTimestamp();
-        try synchronizer.processStep(StepUpdateJob{
+        try self.step_synchronizer.processStep(self, StepUpdateJob{
             .step = completed_step,
             .local_fraction = local_fraction,
             .learning_rate = learning_rate,
             .momentum_beta = self.momentum,
             .fisher_gamma = self.config.fisher_gamma,
             .fisher_epsilon = self.config.fisher_epsilon,
-            .apply_embedding_update = self.gpu_embedding != null and prepared.flat_input_tokens.len > 0,
+            .apply_embedding_update = self.gpu_embedding != null,
             .apply_spectral = apply_spectral,
             .local_step_increment = step_increment_value,
-            .fused = fused_result,
+            .fused = job_fused,
         });
         const update_elapsed = std.time.nanoTimestamp() - update_started;
         if (report_progress) std.debug.print("[Rank 0] Step {d} reduction_update_ms={d}\n", .{ completed_step, @divTrunc(update_elapsed, std.time.ns_per_ms) });
@@ -1738,7 +1882,7 @@ pub const DistributedTrainerFuthark = struct {
             next_prepared.* = task.result;
             task.result = null;
         }
-        if (next_prepare_error) |err| return err;
+        try self.settlePreparedBatch(next_prepare_error, next_prepared);
         return StepResult{
             .step = telemetry.step,
             .loss = telemetry.loss,
@@ -1749,26 +1893,20 @@ pub const DistributedTrainerFuthark = struct {
         };
     }
     pub fn trainStepFuthark(self: *DistributedTrainerFuthark, batch: [][]const u8) !StepResult {
-        var prepared = try self.prepareBatch(batch);
+        var prepared = try self.prepareBatchAgreed(batch);
         defer prepared.deinit();
         var unused_next: ?PreparedBatch = null;
         defer if (unused_next) |*value| value.deinit();
         return self.trainPreparedStepFuthark(&prepared, null, &unused_next);
     }
-    fn makeTemporaryPath(
-        self: *DistributedTrainerFuthark,
-        path: []const u8,
-        suffix: []const u8,
-    ) ![]u8 {
-        const timestamp = std.time.nanoTimestamp();
-        return std.fmt.allocPrint(self.allocator, "{s}.{s}.{d}.{d}.tmp", .{ path, suffix, self.coordinator.rank, timestamp });
-    }
     fn makeTmpFilePath(
         self: *DistributedTrainerFuthark,
         suffix: []const u8,
     ) ![]u8 {
+        const directory = try resolveTemporaryDirectory(self.allocator);
+        defer self.allocator.free(directory);
         const timestamp = std.time.nanoTimestamp();
-        return std.fmt.allocPrint(self.allocator, "/tmp/jaide_{s}_{d}_{d}.tmp", .{ suffix, self.coordinator.rank, timestamp });
+        return std.fmt.allocPrint(self.allocator, "{s}{c}jaide_{s}_{d}_{d}.tmp", .{ directory, std.fs.path.sep, suffix, self.coordinator.rank, timestamp });
     }
     fn readWholeFile(self: *DistributedTrainerFuthark, path: []const u8, max_size: usize) ![]u8 {
         const file = try openReadFile(path);
@@ -1782,6 +1920,7 @@ pub const DistributedTrainerFuthark = struct {
         return data;
     }
     fn writeNsirGraph(writer: anytype, graph: *SelfSimilarRelationalGraph, config: TrainerConfig) !void {
+        if (graph.nodes.count() > config.max_node_count) return TrainerError.NodeCountTooLarge;
         const node_count = try safeUsizeToU32(graph.nodes.count());
         try writer.writeInt(u32, node_count, .little);
         var node_iter = graph.nodes.iterator();
@@ -1849,7 +1988,7 @@ pub const DistributedTrainerFuthark = struct {
         var graph_committed = false;
         errdefer if (!graph_committed) graph_ptr.deinit();
         const node_count = try reader.readInt(u32, .little);
-        if (@as(u64, node_count) > @as(u64, config.max_node_count)) return TrainerError.NodeDataTooLong;
+        if (@as(u64, node_count) > @as(u64, config.max_node_count)) return TrainerError.NodeCountTooLarge;
         var ni: u32 = 0;
         while (ni < node_count) : (ni += 1) {
             const id_len = try reader.readInt(u32, .little);
@@ -2213,6 +2352,13 @@ pub const DistributedTrainerFuthark = struct {
         return values;
     }
     pub fn loadCheckpoint(self: *DistributedTrainerFuthark, path: []const u8) !void {
+        var failure: ?anyerror = null;
+        self.loadCheckpointLocal(path) catch |err| {
+            failure = err;
+        };
+        if (try self.agreeOnStatus(failure != null)) return failure orelse TrainerError.PeerRankFailure;
+    }
+    fn loadCheckpointLocal(self: *DistributedTrainerFuthark, path: []const u8) !void {
         try self.absorbStepState();
         const raw_data = blk: {
             const file = try openReadFile(path);
@@ -2392,6 +2538,19 @@ pub const DistributedTrainerFuthark = struct {
         if (new_tokenizer.next_token_id != saved_vocab_size) return TrainerError.VocabSizeMismatch;
         if (pending_emb_master != null and pending_emb_vocab != new_tokenizer.next_token_id) return TrainerError.VocabSizeMismatch;
         if (pending_target_master != null and pending_target_vocab != new_tokenizer.next_token_id) return TrainerError.VocabSizeMismatch;
+        try admitEstimate(gpu_memory.EstimateConfig{
+            .model_dim = @intCast(self.model_dim),
+            .num_layers = @intCast(self.num_layers),
+            .vocab_size = @intCast(saved_vocab_size),
+            .batch_size = @intCast(self.local_batch_size),
+            .max_seq_len = @intCast(self.runtime_max_seq_len),
+            .world_size = self.coordinator.world_size,
+            .stack_only = true,
+            .frozen_target_f16_only = saved_target_source_frozen == 1,
+            .include_graph_chunk = false,
+            .spectral_temps = false,
+            .coupling = .diagonal,
+        });
         var new_accelerator_ptr = try self.allocator.create(RSFAccelerator);
         var new_accelerator_ptr_committed = false;
         errdefer if (!new_accelerator_ptr_committed) self.allocator.destroy(new_accelerator_ptr);
@@ -2472,10 +2631,8 @@ pub const DistributedTrainerFuthark = struct {
         self.tokenizer.deinit();
         self.tokenizer = new_tokenizer;
         new_tokenizer_committed = true;
-        self.resetSpectralState();
         self.releaseKnowledgeFndsResources();
         self.vocab_size = saved_vocab_size;
-        self.local_batch_size = saved_local_batch_size;
         self.learning_rate = saved_learning_rate;
         self.momentum = saved_momentum;
         self.global_step = saved_global_step;
@@ -2497,7 +2654,6 @@ pub const DistributedTrainerFuthark = struct {
         self.config.grad_mean = saved_grad_mean == 1;
         self.config.use_normalized_gradient_flow = saved_use_normalized_gradient_flow == 1;
         self.config.embedding_seed = saved_embedding_seed;
-        self.config.default_max_seq_len = saved_default_max_seq_len;
         self.config.reasoning_cycles = saved_reasoning_cycles;
         self.config.relational_pass_interval = saved_relational_pass_interval;
         self.config.shuffle_target_control = saved_shuffle_target_control == 1;
@@ -2512,12 +2668,10 @@ pub const DistributedTrainerFuthark = struct {
         });
         self.knowledge_graph_nonce = loaded_nonce;
         self.last_step_telemetry = .{ .step = saved_global_step };
-        if (self.step_synchronizer) |synchronizer| {
-            synchronizer.mutex.lock();
-            synchronizer.telemetry = self.last_step_telemetry;
-            synchronizer.pending_step_increments = 0;
-            synchronizer.mutex.unlock();
-        }
+        self.step_synchronizer.mutex.lock();
+        self.step_synchronizer.telemetry = self.last_step_telemetry;
+        self.step_synchronizer.pending_step_increments = 0;
+        self.step_synchronizer.mutex.unlock();
         tokenizer_tmp_committed = true;
         deletePath(tokenizer_tmp);
         std.debug.print("Checkpoint loaded from {s} at step {d}\n", .{ path, self.global_step });
